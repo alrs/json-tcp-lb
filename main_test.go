@@ -48,20 +48,22 @@ func handleTestConnection(t *testing.T, conn net.Conn, resultChan chan int) {
 
 const logLine = `{"_path":"conn","_system_name":"HQ","_write_ts":"2018-11-28T04:50:48.848281Z","ts":"2018-11-28T04:50:38.834880Z","uid":"CX6jut3BmNwFdYkgrk","id.orig_h":"fc00::165","id.orig_p":44206,"id.resp_h":"fc00::1","id.resp_p":53,"proto":"udp","service":"dns","duration":0.004537,"orig_bytes":55,"resp_bytes":55,"conn_state":"SF","local_orig":false,"local_resp":false,"missed_bytes":0,"history":"Dd","orig_pkts":1,"orig_ip_bytes":103,"resp_pkts":1,"resp_ip_bytes":103,"tunnel_parents":[],"corelight_shunted":false,"orig_l2_addr":"ac:1f:6b:00:81:9a","resp_l2_addr":"b4:75:0e:08:08:c1"}`
 
-func spew(t *testing.T, port int, lines int) {
+func spew(t *testing.T, port int, lines int, errCh chan error) {
+	var err error
+	defer func() { errCh <- err }()
 	line := []byte(logLine + "\n")
 	target := fmt.Sprintf("localhost:%d", port)
 	conn, err := net.DialTimeout("tcp", target, 5*time.Second)
 	if err != nil {
 		log.Printf("Unable to connect to %s: %v", target, err)
-		t.Fatal(err)
+		return
 	}
 	defer conn.Close()
 	log.Printf("Spewing %d lines to port %d", lines, port)
 	for i := 0; i < lines; i++ {
 		_, err := conn.Write(line)
 		if err != nil {
-			t.Fatal(err)
+			return
 		}
 	}
 }
@@ -77,13 +79,23 @@ func TestDirect(t *testing.T) {
 	port := l.Addr().(*net.TCPAddr).Port
 	log.Printf("Listening for tests on %d", port)
 	defer l.Close()
+	errCh := make(chan error, connections)
 	for i := 0; i < connections; i++ {
-		go spew(t, port, linesPerConnnection)
+		go spew(t, port, linesPerConnnection, errCh)
 	}
+	for i := 0; i < connections; i++ {
+		err := <-errCh
+		if err != nil {
+			t.Fatalf("error in spew goroutine: %v", err)
+		}
+	}
+	close(errCh)
+
 	lines, err := listenTestConnection(t, l, connections)
 	if err != nil {
 		t.Fatal(err)
 	}
+
 	log.Printf("Got %d lines total", lines)
 	if lines != expected {
 		t.Errorf("Expected %d lines, got %d", expected, lines)
@@ -120,12 +132,13 @@ func TestProxy(t *testing.T) {
 	go proxy(ctx, pl, targets, connections)
 
 	//Spew everything and then close the proxy listener
+	errCh := make(chan error, connections)
 	go func() {
 		var wg sync.WaitGroup
 		for i := 0; i < connections; i++ {
 			wg.Add(1)
 			go func() {
-				spew(t, proxyPort, linesPerConnnection)
+				spew(t, proxyPort, linesPerConnnection, errCh)
 				log.Printf("Spew done")
 				wg.Done()
 			}()
@@ -139,6 +152,15 @@ func TestProxy(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+
+	for i := 0; i < connections; i++ {
+		err = <-errCh
+		if err != nil {
+			log.Fatalf("error in spew goroutine: %v", err)
+		}
+	}
+	close(errCh)
+
 	log.Printf("Got %d lines total", lines)
 	if lines != expected {
 		t.Errorf("Expected %d lines, got %d", expected, lines)
